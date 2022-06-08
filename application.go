@@ -2,213 +2,181 @@ package application
 
 import (
 	"context"
-	"fmt"
-	"github.com/joho/godotenv"
 	"go.uber.org/dig"
-	"log"
-	"os"
-	"reflect"
 )
 
 type Application struct {
-	container     *dig.Container
-	moduleConfigs []interface{}
+	container *dig.Container
+	modules   []Module
+	context   context.Context
+}
+
+func (a *Application) Modules() []Module {
+	return a.modules
+}
+
+func (a *Application) Context() context.Context {
+	return a.context
 }
 
 func (a *Application) Container() *dig.Container {
 	return a.container
 }
 
-func New(moduleConfigs []interface{}) *Application {
+func New(ctx context.Context, modules []Module) (*Application, error) {
 	container := dig.New()
+
 	app := &Application{
 		container: container,
+		context:   ctx,
+		modules:   modules,
 	}
-	app.readEnv()
 
-	applicationConfig := NewConfig()
+	// If not exist config set default
+	cfg := app.provideConfig()
 
-	app.moduleConfigs = append(moduleConfigs, applicationConfig)
-	app.fillProvidedServices()
+	// If not exist logger set default
+	logger := app.provideLogger()
 
-	return app
-}
+	app.modules = append([]Module{cfg, logger}, app.modules...)
 
-func (a *Application) Run() error {
-	a.initConfig()
-
-	a.setDefaultLogger()
-	a.setDefaultJsonResponseWriter()
-	a.setDefaultValidator()
-
-	a.initHttpRoutes()
-
-	a.onStart()
-	defer a.onClose()
-	return nil
-}
-
-func (a *Application) fillProvidedServices() {
-	for _, moduleConfig := range a.moduleConfigs {
-		if containerHolder, ok := moduleConfig.(ContainerHolder); ok {
-			containerHolder.SetContainer(a.container)
+	for _, module := range app.modules {
+		if appListener, ok := module.(ModulusInitListener); ok {
+			err := appListener.Init(app)
+			if err != nil {
+				return app, err
+			}
 		}
-		if serviceProvider, ok := moduleConfig.(ServiceProvider); ok {
+	}
+
+	for _, module := range app.modules {
+		if serviceProvider, ok := module.(ModulusServiceProvider); ok {
 			if services := serviceProvider.ProvidedServices(); services != nil {
 				for _, service := range services {
-					err := a.container.Provide(service)
+					err := app.container.Provide(service)
 					if err != nil {
-						panic(err)
+						return app, err
 					}
 				}
 			}
 		}
 	}
+
+	return app, nil
 }
 
-func (a *Application) initConfig() {
-	config := NewConfig()
-	for _, serviceProvider := range a.moduleConfigs {
-		if routesContainer, ok := serviceProvider.(ConfigInitializer); ok {
-			err := routesContainer.InitConfig(*config)
-			if err != nil {
-				logger := a.getLogger()
-				logger.Panic(context.Background(), "Init config error: "+err.Error())
-			}
-		}
-	}
-}
+func (a *Application) Start() error {
+	ch := make(chan error)
 
-func (a *Application) readEnv() {
-	filename := ".env"
-	if value, exists := os.LookupEnv("APP_ENV"); exists {
-		filename = ".env." + value
-		if _, err := os.Stat(filename); err == nil {
-			if err := godotenv.Load(filename); err != nil {
-				log.Print("No " + filename + " file found")
-			}
+	for _, module := range a.modules {
+		appListener, ok := module.(ModulusStartListener)
+		if ok {
+			go func() {
+				err := appListener.Start(a)
+				if err != nil {
+					ch <- err
+				}
+			}()
 		}
 	}
-	// loads values from .env into the system
-	if err := godotenv.Load(); err != nil {
-		log.Print("No .env file found")
-	}
-}
 
-func (a *Application) initHttpRoutes() {
-	moduleName := ""
-	defer func() {
-		if err := recover(); err != nil {
-			logger := a.getLogger()
-			logger.Panic(
-				context.Background(),
-				fmt.Sprint(moduleName, ": routes initialisation failed: ", err),
-			)
-		}
-	}()
-	router := a.getRouter()
-
-	if router == nil {
-		return
-	}
-	for _, serviceProvider := range a.moduleConfigs {
-		if t := reflect.TypeOf(serviceProvider); t.Kind() == reflect.Ptr {
-			moduleName = t.Elem().PkgPath()
-		}
-		if routesContainer, ok := serviceProvider.(HttpRoutesInitializer); ok {
-			router.AddRoutes(routesContainer.ModuleRoutes())
-		}
-	}
-}
-
-func (a *Application) onStart() {
-	for _, serviceProvider := range a.moduleConfigs {
-		if appListener, ok := serviceProvider.(StartApplicationListener); ok {
-			err := appListener.OnStart()
-			if err != nil {
-				logger := a.getLogger()
-				logger.Panic(context.Background(), "Start application error: "+err.Error())
-			}
-		}
-	}
-}
-
-func (a *Application) onClose() {
-	for _, serviceProvider := range a.moduleConfigs {
-		if appListener, ok := serviceProvider.(CloseApplicationListener); ok {
-			err := appListener.OnClose()
-			if err != nil {
-				logger := a.getLogger()
-				logger.Panic(context.Background(), "Close application error: "+err.Error())
-			}
-		}
-	}
-}
-
-func (a *Application) setDefaultLogger() {
-	var logger Logger
-	err := a.container.Invoke(func(dep Logger) error {
-		logger = dep
-		return nil
-	})
-	if err != nil || logger == nil {
-		err := a.container.Provide(NewDefaultLogger)
-		if err != nil {
-			panic("Default logger cannot be setup")
-		}
-	}
-}
-
-func (a *Application) setDefaultJsonResponseWriter() {
-	var logger JsonResponseWriter
-	err := a.container.Invoke(func(dep JsonResponseWriter) error {
-		logger = dep
-		return nil
-	})
-	if err != nil || logger == nil {
-		err := a.container.Provide(NewJsonResponseWriter)
-		if err != nil {
-			panic("Default json response writer cannot be setup")
-		}
-	}
-}
-
-func (a *Application) setDefaultValidator() {
-	var validator Validator
-	err := a.container.Invoke(func(dep Validator) error {
-		validator = dep
-		return nil
-	})
-	if err != nil || validator == nil {
-		err := a.container.Provide(NewDefaultValidator)
-		if err != nil {
-			panic("Default validator cannot be setup")
-		}
-	}
-}
-
-func (a *Application) getLogger() Logger {
-	var logger Logger
-	err := a.container.Invoke(func(dep Logger) error {
-		logger = dep
-		return nil
-	})
+	err := <-ch
 	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *Application) Stop() error {
+	ch := make(chan error)
+
+	for _, module := range a.modules {
+		appListener, ok := module.(ModulusStopListener)
+		if ok {
+			go func() {
+				err := appListener.Stop(a)
+				if err != nil {
+					ch <- err
+				}
+			}()
+		}
+	}
+
+	err := <-ch
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *Application) Logger() Logger {
+	var logger Logger
+	err := a.container.Invoke(
+		func(dep Logger) error {
+			logger = dep
+			return nil
+		},
+	)
+	if err != nil || logger == nil {
 		return NewDefaultLogger()
 	}
 
 	return logger
 }
 
-func (a *Application) getRouter() Router {
-	var router Router
-	err := a.container.Invoke(func(dep Router) error {
-		router = dep
-		return nil
-	})
-	if err != nil {
-		return nil
+func (a *Application) Config() Config {
+	var config Config
+	err := a.container.Invoke(
+		func(dep Config) error {
+			config = dep
+			return nil
+		},
+	)
+	if err != nil || config == nil {
+		return NewDefaultConfig()
 	}
 
-	return router
+	return config
+}
+
+func (a *Application) provideLogger() Logger {
+	var logger Logger
+	for _, module := range a.modules {
+		var ok bool
+		if logger, ok = module.(Logger); ok {
+			break
+		}
+	}
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	err := a.container.Provide(func() Logger { return logger })
+	if err != nil {
+		panic("Logger cannot be provided")
+	}
+
+	return logger
+}
+
+func (a *Application) provideConfig() Config {
+	var cfg Config
+	for _, module := range a.modules {
+		var ok bool
+		if cfg, ok = module.(Config); ok {
+			break
+		}
+	}
+	if cfg == nil {
+		cfg = NewDefaultConfig()
+	}
+
+	err := a.container.Provide(func() Config { return cfg })
+	if err != nil {
+		panic("Config cannot be provided")
+	}
+
+	return cfg
 }
